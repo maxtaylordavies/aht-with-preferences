@@ -1,52 +1,60 @@
-import time
-from typing import Callable, Tuple
+from typing import Callable, Dict, Tuple
 
 import chex
 import jax
 import jax.numpy as jnp
-from rejax.evaluate import evaluate
 import pandas as pd
 from tqdm import tqdm
 
-from .lbf import LBFEnv, LBFEnvParams, make
+from src.evaluate import evaluate, Policy
+from src.utils import get_type_dists
+from .lbf import LBFEnv, LBFEnvParams, LBFEnvState, make
 
-eval_npc_type_dists = {
-    "no overlap": jnp.array([0, 1, 0, 0, 0, 0, 0, 0]),
-    "partial overlap": jnp.array([0, 0, 1, 1, 1, 1, 0, 0]) / 4,
-    "full overlap": jnp.array([0, 0, 0, 0, 0, 0, 1, 1]) / 2,
-    "overall": jnp.array([0, 1, 1, 1, 1, 1, 1, 1]) / 7
-}
 
-def get_env_params(default_params, eval_type):
-    return LBFEnvParams(
-        max_steps_in_episode=default_params.max_steps_in_episode,
-        learner_agent_type=default_params.learner_agent_type,
-        npc_policy_params=default_params.npc_policy_params,
-        normalise_reward=default_params.normalise_reward,
-        npc_type_dist=eval_npc_type_dists[eval_type]
-    )
+def compute_episode_metrics(final_state: LBFEnvState) -> Dict[str, chex.Array]:
+    agent_level = final_state.agent_levels[0]
+    goal_levels = final_state.fruit_levels * final_state.goals_attempted
+    solo_goals = jnp.where((goal_levels <= agent_level) & (goal_levels > 0), 1, 0)
+    coop_goals = jnp.where(goal_levels > agent_level, 1, 0)
+    return {"n_solo": solo_goals.sum(), "n_coop": coop_goals.sum()}
+
 
 def run_evals(
     rng: chex.PRNGKey,
-    policy: Callable[[chex.Array, chex.PRNGKey], chex.Array],
+    policy: Policy,
     env: LBFEnv,
     default_env_params: LBFEnvParams,
-    num_seeds=100
+    num_seeds=100,
 ) -> pd.DataFrame:
-    eval_data = {"eval type": [], "return": []}
+    eval_data = {"eval type": [], "return": [], "cooperativity": []}
+    eval_npc_type_dists = get_type_dists(
+        env.prefs_support, env.prefs_support[default_env_params.learner_agent_type]
+    )
+
     for k in tqdm(eval_npc_type_dists.keys()):
-        env_params = get_env_params(default_env_params, k)
-        _, returns = evaluate(
+        env_params = LBFEnvParams(
+            max_steps_in_episode=default_env_params.max_steps_in_episode,
+            learner_agent_type=default_env_params.learner_agent_type,
+            npc_policy_params=default_env_params.npc_policy_params,
+            normalise_reward=default_env_params.normalise_reward,
+            npc_type_dist=eval_npc_type_dists[k],
+        )
+        _, returns, metrics = evaluate(
             policy,
             rng,
             env,
             env_params,
+            compute_episode_metrics,
             num_seeds,
-            max_steps_in_episode=env_params.max_steps_in_episode
+            max_steps_in_episode=env_params.max_steps_in_episode,
         )
         eval_data["eval type"].extend([k] * num_seeds)
         eval_data["return"].extend(returns.tolist())
+        metrics = {k: int(v.sum()) for k, v in metrics.items()}
+        cooperativity = metrics["n_coop"] / (metrics["n_coop"] + metrics["n_solo"])
+        eval_data["cooperativity"].extend([cooperativity] * num_seeds)
     return pd.DataFrame(eval_data)
+
 
 def compute_lbf_reference_returns(key: chex.PRNGKey, n_eps=100) -> pd.DataFrame:
     eval_data = {"eval type": [], "return": []}
@@ -63,7 +71,9 @@ def compute_lbf_reference_returns(key: chex.PRNGKey, n_eps=100) -> pd.DataFrame:
             key, state, ret, done = args
             key, key_policy, key_step = jax.random.split(key, 3)
             action = policy_jitted(key_policy, state, 0)
-            obs, state, reward, done, _ = step_jitted(key_step, state, action, env_params)
+            obs, state, reward, done, _ = step_jitted(
+                key_step, state, action, env_params
+            )
             return key, state, ret + reward, done
 
         _, state = env.reset(key, env_params)
@@ -76,9 +86,7 @@ def compute_lbf_reference_returns(key: chex.PRNGKey, n_eps=100) -> pd.DataFrame:
     for eval_type in tqdm(eval_npc_type_dists.keys()):
         env_params = get_env_params(default_env_params, eval_type)
         keys = jax.random.split(key, n_eps)
-        returns = jax.vmap(
-            play_episode, in_axes=(0, None)
-        )(keys, env_params)
+        returns = jax.vmap(play_episode, in_axes=(0, None))(keys, env_params)
         eval_data["eval type"].extend([eval_type] * n_eps)
         eval_data["return"].extend(returns.tolist())
 

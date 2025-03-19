@@ -1,17 +1,10 @@
-"""
-2D rendering of the level based foraging domain
-"""
-
-import math
 import os
 import sys
 
 import numpy as np
-import math
 import six
 from gymnasium import error
 
-from src.utils import from_one_hot
 from .lbf import LBFEnvState
 
 if "Apple" in sys.version:
@@ -120,26 +113,30 @@ class Viewer(object):
         v_lines, h_lines = [], []
 
         for r in range(self.rows + 1):
-            v_lines.append(shapes.Line(
-                0,  # LEFT X
-                (self.grid_size + 1) * r + 1,  # Y
-                (self.grid_size + 1) * self.cols,  # RIGHT X
-                (self.grid_size + 1) * r + 1,  # Y,
-                thickness=2,
-                color=_BLACK,
-                batch=batch,
-            ))
+            v_lines.append(
+                shapes.Line(
+                    0,  # LEFT X
+                    (self.grid_size + 1) * r + 1,  # Y
+                    (self.grid_size + 1) * self.cols,  # RIGHT X
+                    (self.grid_size + 1) * r + 1,  # Y,
+                    thickness=4,
+                    color=_BLACK,
+                    batch=batch,
+                )
+            )
 
         for c in range(self.cols + 1):
-            h_lines.append(shapes.Line(
-                (self.grid_size + 1) * c + 1,  # X
-                0,  # BOTTOM Y
-                (self.grid_size + 1) * c + 1,  # X
-                (self.grid_size + 1) * self.rows,  # TOP X
-                thickness=2,
-                color=_BLACK,
-                batch=batch,
-            ))
+            h_lines.append(
+                shapes.Line(
+                    (self.grid_size + 1) * c + 1,  # X
+                    0,  # BOTTOM Y
+                    (self.grid_size + 1) * c + 1,  # X
+                    (self.grid_size + 1) * self.rows,  # TOP X
+                    thickness=4,
+                    color=_BLACK,
+                    batch=batch,
+                )
+            )
 
         batch.draw()
 
@@ -210,7 +207,13 @@ class Viewer(object):
         marker_y = self.height - (self.grid_size + 1) * (row + 0.1)
         size = self.grid_size / 5
         triangle = shapes.Triangle(
-            marker_x, marker_y, marker_x - size, marker_y + size, marker_x + size, marker_y + size, color=_RED
+            marker_x,
+            marker_y,
+            marker_x - size,
+            marker_y + size,
+            marker_x + size,
+            marker_y + size,
+            color=_RED,
         )
         triangle.draw()
 

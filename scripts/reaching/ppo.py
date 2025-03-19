@@ -1,21 +1,13 @@
 import time
-from itertools import product
 
-import chex
 import jax
 import jax.numpy as jnp
 from rejax import PPO
 import pandas as pd
-from tqdm import tqdm
 
-from src.environments.lbf import (
-    LBFEnv,
-    LBFEnvParams,
-    NPCPolicyParams,
-    make,
-    run_evals
-)
-from src.utils import save_returns_data
+from src.environments.reaching import make, run_evals
+from src.evaluate import Policy
+from src.utils import save_dataframes
 
 rng = jax.random.PRNGKey(0)
 env, default_env_params = make()
@@ -23,8 +15,8 @@ env, default_env_params = make()
 algo = PPO.create(
     env=env,
     env_params=default_env_params,
-    total_timesteps=2e6,
-    eval_freq=5000,
+    total_timesteps=1e5,
+    eval_freq=1000,
     num_envs=16,
     num_steps=128,
     num_epochs=1,
@@ -49,19 +41,22 @@ print(f"Finished training in {elapsed:.2f}s ({sps:.2f} steps/s)")
 
 _, ep_returns = evaluation
 mean_returns = ep_returns.mean(axis=1)
-train_df = pd.DataFrame({
-    "timestep": jnp.linspace(0, algo.total_timesteps, len(mean_returns)),
-    "return": mean_returns,
-})
+train_df = pd.DataFrame(
+    {
+        "timestep": jnp.linspace(0, algo.total_timesteps, len(mean_returns)),
+        "return": mean_returns,
+    }
+)
 
 # run evals
 print("Running evals...")
 start_time = time.time()
-policy = jax.jit(algo.make_act(train_state))
-eval_df = run_evals(rng, policy, env, default_env_params)
+_policy = algo.make_act(train_state)
+policy: Policy = jax.jit(lambda key, obs, state: _policy(obs, key))
+eval_df = run_evals(rng, policy, env, default_env_params, num_seeds=500)
 
 elapsed = time.time() - start_time
 print(f"Finished evals in {elapsed:.2f}s")
 
 # save data
-save_returns_data("lbf", "ppo", train_df, eval_df)
+save_dataframes(env.name, "ppo", train_df, eval_df)

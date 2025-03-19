@@ -12,6 +12,7 @@ from gymnax.environments import spaces
 
 from src.utils import to_one_hot
 
+
 class Action(Enum):
     NONE = 0
     NORTH = 1
@@ -20,17 +21,24 @@ class Action(Enum):
     EAST = 4
     LOAD = 5
 
+
 ACTION_TO_DIRECTION = jnp.array([[0, 0], [-1, 0], [1, 0], [0, -1], [0, 1], [0, 0]])
+
+
+def get_prefs_support(n_fruit_types: int) -> chex.Array:
+    return jnp.array(list(product([0.0, 1.0], repeat=n_fruit_types)))
+
 
 @struct.dataclass
 class LBFEnvState(environment.EnvState):
-    agent_locs: chex.ArrayNumpy
-    agent_levels: chex.ArrayNumpy
-    agent_types: chex.ArrayNumpy
-    fruit_locs: chex.ArrayNumpy
-    fruit_levels: chex.ArrayNumpy
-    fruit_types: chex.ArrayNumpy
-    fruit_consumed: chex.ArrayNumpy
+    agent_locs: chex.Array
+    agent_levels: chex.Array
+    agent_types: chex.Array
+    fruit_locs: chex.Array
+    fruit_levels: chex.Array
+    fruit_types: chex.Array
+    fruit_consumed: chex.Array
+    goals_attempted: chex.Array
     max_available_reward: float
     time: int
 
@@ -40,6 +48,7 @@ class NPCPolicyParams:
     from_centre: bool = True
     aware_of_level: bool = False
     aware_of_prefs: bool = True
+
 
 @struct.dataclass
 class LBFEnvParams(environment.EnvParams):
@@ -69,9 +78,7 @@ class LBFEnv(environment.Environment):
         self.max_player_level = max_player_level
         self.penalty = penalty
 
-        self.prefs_support = jnp.array(
-            list(product([0.0, 1.0], repeat=self.n_fruit_types))
-        )
+        self.prefs_support = get_prefs_support(self.n_fruit_types)
         self.n_agent_types = len(self.prefs_support)
         self.default_type_dist = jnp.concatenate(
             [jnp.array([0.0]), jnp.ones((self.n_agent_types - 1,))]
@@ -86,7 +93,9 @@ class LBFEnv(environment.Environment):
     ) -> Tuple[chex.Array, LBFEnvState]:
         """Reset environment state"""
         agent_locs, agent_levels, agent_types = self.spawn_agents(key, params)
-        fruit_locs, fruit_levels, fruit_types, fruits_consumed = self.spawn_fruits(key, agent_locs, agent_levels)
+        fruit_locs, fruit_levels, fruit_types, fruits_consumed = self.spawn_fruits(
+            key, agent_locs, agent_levels
+        )
         state = LBFEnvState(
             agent_locs=agent_locs,
             agent_levels=agent_levels,
@@ -95,13 +104,12 @@ class LBFEnv(environment.Environment):
             fruit_levels=fruit_levels,
             fruit_types=fruit_types,
             fruit_consumed=fruits_consumed,
+            goals_attempted=jnp.zeros_like(fruit_types, dtype=jnp.int32),
             max_available_reward=1.0,
             time=0,
         )
         max_reward = self.compute_max_available_reward(state)
-        max_reward = (
-            jnp.where(params.normalise_reward, max_reward, 1.0)
-        )
+        max_reward = jnp.where(params.normalise_reward, max_reward, 1.0)
         state = state.replace(max_available_reward=max_reward)
         return self.get_obs(state, params), state
 
@@ -111,7 +119,7 @@ class LBFEnv(environment.Environment):
         state: LBFEnvState,
         action: Union[int, float, chex.Array],
         params: LBFEnvParams,
-    ) -> Tuple[chex.ArrayNumpy, LBFEnvState, chex.ArrayNumpy, chex.ArrayNumpy, Dict[Any, Any]]:
+    ) -> Tuple[chex.Array, LBFEnvState, chex.Array, chex.Array, Dict[Any, Any]]:
         """Perform single timestep state transition."""
         rewards = jnp.zeros((self.n_players,))
 
@@ -136,9 +144,7 @@ class LBFEnv(environment.Environment):
         new_locs = jnp.copy(state.agent_locs)
         for i in range(self.n_players):
             maybe_new_loc = state.agent_locs[i] + ACTION_TO_DIRECTION[actions[i]]
-            occupied_by_agent = jnp.any(
-                jnp.all(new_locs == maybe_new_loc, axis=-1)
-            )
+            occupied_by_agent = jnp.any(jnp.all(new_locs == maybe_new_loc, axis=-1))
             occupied_by_fruit = jnp.any(
                 jnp.logical_and(
                     jnp.all(state.fruit_locs == maybe_new_loc, axis=-1),
@@ -153,23 +159,22 @@ class LBFEnv(environment.Environment):
         # PROCESS FRUIT COLLECTION
         trying_to_load = (actions == Action.LOAD.value).astype(int)
         consumed = jnp.copy(state.fruit_consumed)
+        learner_goal_attempts = jnp.zeros_like(state.fruit_consumed)
         for i in range(self.n_fruits):
             # determine if fruit is successfully collected
             attempting = self.adjacent_agents(i, state) * trying_to_load
+            learner_goal_attempts = learner_goal_attempts.at[i].add(attempting[0])
             level_sum = (state.agent_levels * attempting).sum()
             success = jnp.logical_and(
-                level_sum >= state.fruit_levels[i],
-                jnp.logical_not(consumed[i])
+                level_sum >= state.fruit_levels[i], jnp.logical_not(consumed[i])
             )
             # increment rewards
-            rs = jax.vmap(
-                self.compute_reward, in_axes=(0, None, None)
-            )(state.agent_types, state.fruit_types[i], state.fruit_levels[i])
-            rewards += (rs * success * attempting)
-            # remove fruit (mark as consumed)
-            consumed = consumed.at[i].set(
-                jnp.logical_or(consumed[i], success)
+            rs = jax.vmap(self.compute_reward, in_axes=(0, None, None))(
+                state.agent_types, state.fruit_types[i], state.fruit_levels[i]
             )
+            rewards += rs * success * attempting
+            # remove fruit (mark as consumed)
+            consumed = consumed.at[i].set(jnp.logical_or(consumed[i], success))
 
         # Update state dict and evaluate termination conditions
         state = LBFEnvState(
@@ -180,35 +185,42 @@ class LBFEnv(environment.Environment):
             fruit_levels=state.fruit_levels,
             fruit_types=state.fruit_types,
             fruit_consumed=consumed,
+            goals_attempted=state.goals_attempted | learner_goal_attempts,
             max_available_reward=state.max_available_reward,
             time=state.time + 1,
         )
         done = self.is_terminal(state, params)
-        reward_norm_factor = jnp.where(state.max_available_reward == 0, 1.0, state.max_available_reward)
+        reward_norm_factor = jnp.where(
+            state.max_available_reward == 0, 1.0, state.max_available_reward
+        )
         r = rewards[0] / reward_norm_factor
         return (  # type: ignore
             jax.lax.stop_gradient(self.get_obs(state)),
             jax.lax.stop_gradient(state),
             r,
             done,
-            # {"collisions": collisions, "trying_to_load": trying_to_load},
-            {}
+            {},
         )
 
-    def compute_reward(self, agent_type: int, fruit_type: int, fruit_level: int) -> chex.Array:
-        return fruit_level *  self.prefs_support[agent_type][fruit_type]
+    def compute_reward(
+        self, agent_type: int, fruit_type: int, fruit_level: int
+    ) -> chex.Array:
+        return fruit_level * self.prefs_support[agent_type][fruit_type]
 
     def compute_max_available_reward(self, state: LBFEnvState) -> chex.Array:
         max_reward = 0.0
         for i in range(self.n_fruits):
-            u_self = self.compute_reward(state.agent_types[0], state.fruit_types[i], state.fruit_levels[i])
-            u_npc = self.compute_reward(state.agent_types[1], state.fruit_types[i], state.fruit_levels[i])
+            u_self = self.compute_reward(
+                state.agent_types[0], state.fruit_types[i], state.fruit_levels[i]
+            )
+            u_npc = self.compute_reward(
+                state.agent_types[1], state.fruit_types[i], state.fruit_levels[i]
+            )
             obtainable = jnp.logical_and(
                 u_self > 0,
                 jnp.logical_or(
-                    state.fruit_levels[i] <= state.agent_levels[0],
-                    u_npc > 0
-                )
+                    state.fruit_levels[i] <= state.agent_levels[0], u_npc > 0
+                ),
             )
             max_reward += jnp.where(obtainable, u_self, 0.0)
         return max_reward
@@ -241,12 +253,12 @@ class LBFEnv(environment.Environment):
         )
         return (agent_dists == 1.0).astype(int)
 
-    def spawn_agents(self, key: chex.PRNGKey, params: LBFEnvParams) -> Tuple[chex.Array, chex.Array, chex.Array]:
+    def spawn_agents(
+        self, key: chex.PRNGKey, params: LBFEnvParams
+    ) -> Tuple[chex.Array, chex.Array, chex.Array]:
         # sample types
-        type_dist: chex.Array = jnp.where( # type: ignore
-            params.npc_type_dist == -1.0,
-            self.default_type_dist,
-            params.npc_type_dist
+        type_dist: chex.Array = jnp.where(  # type: ignore
+            params.npc_type_dist == -1.0, self.default_type_dist, params.npc_type_dist
         )
         type_dist /= type_dist.sum()
         npc_types = jax.random.choice(
@@ -268,7 +280,9 @@ class LBFEnv(environment.Environment):
 
         return positions, levels, types
 
-    def spawn_fruits(self, key: chex.PRNGKey, agent_locs: chex.Array, agent_levels: chex.Array) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
+    def spawn_fruits(
+        self, key: chex.PRNGKey, agent_locs: chex.Array, agent_levels: chex.Array
+    ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
         # sample types
         types = jax.random.randint(key, (self.n_fruits,), 0, self.n_fruit_types)
 
@@ -368,7 +382,7 @@ class LBFEnv(environment.Environment):
     @property
     def name(self) -> str:
         """Environment name."""
-        return "LBF"
+        return "lbf"
 
     @property
     def num_actions(self) -> int:
@@ -381,6 +395,7 @@ class LBFEnv(environment.Environment):
 
     def _init_render(self):
         from .rendering import Viewer
+
         self.viewer = Viewer((self.grid_size, self.grid_size))
         self.rendering_initialized = True
 
@@ -405,22 +420,26 @@ class LBFEnv(environment.Environment):
     def fruit_values(self, state: LBFEnvState, agent_idx) -> chex.Array:
         prefs = self.prefs_support[state.agent_types[agent_idx]]
         vals = prefs[state.fruit_types]
-        return jnp.where(
-            state.fruit_consumed,
-            0,
-            state.fruit_levels * vals
-        )
+        return jnp.where(state.fruit_consumed, 0, state.fruit_levels * vals)
 
-    def load_or_move_towards(self, key: chex.PRNGKey, agent_pos: chex.Array, fruit_pos: chex.Array, state: LBFEnvState) -> chex.Array:
+    def load_or_move_towards(
+        self,
+        key: chex.PRNGKey,
+        agent_pos: chex.Array,
+        fruit_pos: chex.Array,
+        state: LBFEnvState,
+    ) -> chex.Array:
         distance = jnp.abs(fruit_pos - agent_pos).sum()
 
         # first get the locations of tiles adjacent to fruit_pos
-        adjacents = jnp.array([
-            [fruit_pos[0] - 1, fruit_pos[1]],
-            [fruit_pos[0] + 1, fruit_pos[1]],
-            [fruit_pos[0], fruit_pos[1] - 1],
-            [fruit_pos[0], fruit_pos[1] + 1],
-        ])
+        adjacents = jnp.array(
+            [
+                [fruit_pos[0] - 1, fruit_pos[1]],
+                [fruit_pos[0] + 1, fruit_pos[1]],
+                [fruit_pos[0], fruit_pos[1] - 1],
+                [fruit_pos[0], fruit_pos[1] + 1],
+            ]
+        )
 
         # then check which adjacent locations are valid targets
         # i.e. not out of bounds and not occupied by another agent or fruit
@@ -436,7 +455,9 @@ class LBFEnv(environment.Environment):
                 jnp.all(state.fruit_locs == adjacents[i], axis=-1)
             )
             occupied = jnp.logical_or(occupied_by_agent, occupied_by_fruit)
-            valid = valid.at[i].set(jnp.logical_not(jnp.logical_or(out_of_bounds, occupied)))
+            valid = valid.at[i].set(
+                jnp.logical_not(jnp.logical_or(out_of_bounds, occupied))
+            )
 
         # find the closest valid adjacent location
         distances = jnp.abs(adjacents - agent_pos).sum(axis=-1)
@@ -445,8 +466,12 @@ class LBFEnv(environment.Environment):
 
         # get the direction to move in
         direction = jnp.sign(closest - agent_pos)
-        vertical_action = (Action.NORTH.value * (direction[0] == -1)) + (Action.SOUTH.value * (direction[0] == 1))
-        horizontal_action = (Action.WEST.value * (direction[1] == -1)) + (Action.EAST.value * (direction[1] == 1))
+        vertical_action = (Action.NORTH.value * (direction[0] == -1)) + (
+            Action.SOUTH.value * (direction[0] == 1)
+        )
+        horizontal_action = (Action.WEST.value * (direction[1] == -1)) + (
+            Action.EAST.value * (direction[1] == 1)
+        )
 
         # randomly choose between vertical and horizontal movement if both are valid
         choice = jax.random.randint(key, (), 0, 2)
@@ -456,7 +481,7 @@ class LBFEnv(environment.Environment):
         move_action = jnp.where(
             move_action == 0,
             jnp.maximum(vertical_action, horizontal_action),
-            move_action
+            move_action,
         )
 
         # if we're adjacent to the fruit, load it, otherwise return move action
@@ -475,7 +500,9 @@ class LBFEnv(environment.Environment):
 
         values = self.fruit_values(state, agent_idx)
         min_value = jnp.where(params.aware_of_prefs, values.max(), values.min())
-        max_level = jnp.where(params.aware_of_level, state.agent_levels[agent_idx], jnp.inf)
+        max_level = jnp.where(
+            params.aware_of_level, state.agent_levels[agent_idx], jnp.inf
+        )
 
         dists = self.fruit_distances(state, start)
         dists = jnp.where(values < min_value, jnp.inf, dists)
@@ -484,44 +511,33 @@ class LBFEnv(environment.Environment):
 
         best = jnp.argmin(dists)
         action = self.load_or_move_towards(
-            key,
-            state.agent_locs[agent_idx],
-            state.fruit_locs[best],
-            state
+            key, state.agent_locs[agent_idx], state.fruit_locs[best], state
         )
-        return jnp.where(
-            dists[best] == jnp.inf,
-            Action.NONE.value,
-            action
-        )
+        return jnp.where(dists[best] == jnp.inf, Action.NONE.value, action)
 
-    def reference_policy(self, key: chex.PRNGKey, state: LBFEnvState, agent_idx: int) -> chex.Array:
+    def reference_policy(
+        self, key: chex.PRNGKey, state: LBFEnvState, agent_idx: int
+    ) -> chex.Array:
         self_idx, npc_idx = agent_idx, 1 - agent_idx
         own_fruit_vals = self.fruit_values(state, self_idx)
         teammate_fruit_vals = self.fruit_values(state, npc_idx)
 
         attainable = jnp.logical_or(
-            state.fruit_levels <= state.agent_levels[self_idx],
-            teammate_fruit_vals > 0
+            state.fruit_levels <= state.agent_levels[self_idx], teammate_fruit_vals > 0
         )
         own_fruit_vals *= attainable.astype(int)
 
         distances = self.fruit_distances(state, state.agent_locs[self_idx])
-        distances = jnp.where(own_fruit_vals == own_fruit_vals.max(), distances, jnp.inf)
+        distances = jnp.where(
+            own_fruit_vals == own_fruit_vals.max(), distances, jnp.inf
+        )
         best = jnp.argmin(distances)
 
         action = self.load_or_move_towards(
-            key,
-            state.agent_locs[self_idx],
-            state.fruit_locs[best],
-            state
+            key, state.agent_locs[self_idx], state.fruit_locs[best], state
         )
 
-        return jnp.where(
-            own_fruit_vals.max() == 0,
-            Action.NONE.value,
-            action
-        )
+        return jnp.where(own_fruit_vals.max() == 0, Action.NONE.value, action)
 
 
 def make(
