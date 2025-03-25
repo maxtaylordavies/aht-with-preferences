@@ -55,7 +55,7 @@ class LBFEnvParams(environment.EnvParams):
     learner_agent_type: int = 6
     npc_policy_params: NPCPolicyParams = NPCPolicyParams()
     npc_type_dist: chex.Array = jnp.array(-1.0)
-    normalise_reward: bool = True
+    normalise_rewards: bool = True
     max_steps_in_episode: int = 50
 
 
@@ -93,7 +93,7 @@ class LBFEnv(environment.Environment):
     ) -> Tuple[chex.Array, LBFEnvState]:
         """Reset environment state"""
         agent_locs, agent_levels, agent_types = self.spawn_agents(key, params)
-        fruit_locs, fruit_levels, fruit_types, fruits_consumed = self.spawn_fruits(
+        fruit_locs, fruit_levels, fruit_types, fruit_consumed = self.spawn_fruits(
             key, agent_locs, agent_levels
         )
         state = LBFEnvState(
@@ -103,13 +103,13 @@ class LBFEnv(environment.Environment):
             fruit_locs=fruit_locs,
             fruit_levels=fruit_levels,
             fruit_types=fruit_types,
-            fruit_consumed=fruits_consumed,
+            fruit_consumed=fruit_consumed,
             goals_attempted=jnp.zeros_like(fruit_types, dtype=jnp.int32),
             max_available_reward=1.0,
             time=0,
         )
         max_reward = self.compute_max_available_reward(state)
-        max_reward = jnp.where(params.normalise_reward, max_reward, 1.0)
+        max_reward = jnp.where(params.normalise_rewards, max_reward, 1.0)
         state = state.replace(max_available_reward=max_reward)
         return self.get_obs(state, params), state
 
@@ -121,7 +121,7 @@ class LBFEnv(environment.Environment):
         params: LBFEnvParams,
     ) -> Tuple[chex.Array, LBFEnvState, chex.Array, chex.Array, Dict[Any, Any]]:
         """Perform single timestep state transition."""
-        rewards = jnp.zeros((self.n_players,))
+        r = 0
 
         npc_actions = jax.vmap(
             self.heuristic_policy,
@@ -158,23 +158,21 @@ class LBFEnv(environment.Environment):
 
         # PROCESS FRUIT COLLECTION
         trying_to_load = (actions == Action.LOAD.value).astype(int)
-        consumed = jnp.copy(state.fruit_consumed)
+        consumed = state.fruit_consumed.copy()
         learner_goal_attempts = jnp.zeros_like(state.fruit_consumed)
         for i in range(self.n_fruits):
             # determine if fruit is successfully collected
             attempting = self.adjacent_agents(i, state) * trying_to_load
             learner_goal_attempts = learner_goal_attempts.at[i].add(attempting[0])
             level_sum = (state.agent_levels * attempting).sum()
-            success = jnp.logical_and(
-                level_sum >= state.fruit_levels[i], jnp.logical_not(consumed[i])
+            success = (level_sum >= state.fruit_levels[i]) & (~consumed[i])
+            # increment reward
+            r_ = self.compute_reward(
+                state.agent_types[0], state.fruit_types[i], state.fruit_levels[i]
             )
-            # increment rewards
-            rs = jax.vmap(self.compute_reward, in_axes=(0, None, None))(
-                state.agent_types, state.fruit_types[i], state.fruit_levels[i]
-            )
-            rewards += rs * success * attempting
+            r += r_ * success * attempting[0]
             # remove fruit (mark as consumed)
-            consumed = consumed.at[i].set(jnp.logical_or(consumed[i], success))
+            consumed = consumed.at[i].set(consumed[i] | success)
 
         # Update state dict and evaluate termination conditions
         state = LBFEnvState(
@@ -190,10 +188,7 @@ class LBFEnv(environment.Environment):
             time=state.time + 1,
         )
         done = self.is_terminal(state, params)
-        reward_norm_factor = jnp.where(
-            state.max_available_reward == 0, 1.0, state.max_available_reward
-        )
-        r = rewards[0] / reward_norm_factor
+        # r /= jnp.where(state.max_available_reward == 0, 1.0, state.max_available_reward)
         return (  # type: ignore
             jax.lax.stop_gradient(self.get_obs(state)),
             jax.lax.stop_gradient(state),
@@ -216,11 +211,8 @@ class LBFEnv(environment.Environment):
             u_npc = self.compute_reward(
                 state.agent_types[1], state.fruit_types[i], state.fruit_levels[i]
             )
-            obtainable = jnp.logical_and(
-                u_self > 0,
-                jnp.logical_or(
-                    state.fruit_levels[i] <= state.agent_levels[0], u_npc > 0
-                ),
+            obtainable = (u_self > 0) & (
+                (state.fruit_levels[i] <= state.agent_levels[0]) | (u_npc > 0)
             )
             max_reward += jnp.where(obtainable, u_self, 0.0)
         return max_reward
@@ -290,16 +282,65 @@ class LBFEnv(environment.Environment):
         max_level = agent_levels.sum()
         levels = jax.random.randint(key, (self.n_fruits,), 1, max_level + 1)
 
-        # sample positions without replacement
-        # need to ensure we don't sample locations containing agents
-        probs = jnp.ones((self.grid_size, self.grid_size), dtype=jnp.float32)
-        probs = probs.at[agent_locs].set(0.0)
-        probs = probs.reshape(-1) / probs.sum()
-        positions = jax.random.choice(
-            key, jnp.arange(self.grid_size**2), (self.n_fruits,), replace=False, p=probs
+        # initialize positions array with -1s
+        positions = jnp.full((self.n_fruits, 2), -1, dtype=jnp.int32)
+
+        def cond_fn(state):
+            i, positions, key, _ = state
+            return i < self.n_fruits
+
+        def body_fn(state):
+            i, positions, key, valid_mask = state
+            key, subkey = jax.random.split(key)
+
+            # update valid_mask based on previously placed fruits
+            def update_mask(j, mask):
+                fruit_pos = positions[j]
+                valid_update = (fruit_pos != jnp.array([-1, -1])).all()
+
+                # calculate taxicab distances from this fruit to all grid positions
+                y_coords = jnp.arange(self.grid_size)[:, None]
+                x_coords = jnp.arange(self.grid_size)[None, :]
+                y_dists = jnp.abs(y_coords - fruit_pos[0])
+                x_dists = jnp.abs(x_coords - fruit_pos[1])
+                taxicab_dists = y_dists + x_dists
+
+                # mark positions with taxicab distance < 3 as invalid
+                invalid_positions = taxicab_dists < 3
+                updated_mask = jnp.where(invalid_positions, 0.0, mask)
+
+                return jnp.where(valid_update, updated_mask, mask)
+
+            # apply mask updates from all previously placed fruits
+            updated_mask = jax.lax.fori_loop(0, i, update_mask, valid_mask)
+            probs = updated_mask.reshape(-1)
+            sum_probs = probs.sum()
+
+            # handle case where there are no valid positions left
+            has_valid_positions = sum_probs > 0
+            normalized_probs = jnp.where(
+                has_valid_positions,
+                probs / sum_probs,
+                jnp.ones_like(probs) / probs.shape[0],
+            )
+
+            # select position for this fruit
+            pos_idx = jax.random.choice(
+                subkey, jnp.arange(self.grid_size**2), (1,), p=normalized_probs
+            )[0]
+            pos = jnp.unravel_index(pos_idx, (self.grid_size, self.grid_size))
+
+            # update positions array
+            new_positions = positions.at[i].set(jnp.array(pos))
+            positions_to_use = jnp.where(has_valid_positions, new_positions, positions)
+            return i + 1, positions_to_use, key, valid_mask
+
+        # place fruits one by one
+        valid_mask = jnp.ones((self.grid_size, self.grid_size), dtype=jnp.float32)
+        valid_mask = valid_mask.at[agent_locs].set(0.0)
+        _, positions, _, _ = jax.lax.while_loop(
+            cond_fn, body_fn, (0, positions, key, valid_mask)
         )
-        positions = jnp.unravel_index(positions, (self.grid_size, self.grid_size))
-        positions = jnp.stack(positions, axis=-1)
 
         return positions, levels, types, jnp.zeros((self.n_fruits,), dtype=jnp.int32)
 
@@ -505,9 +546,14 @@ class LBFEnv(environment.Environment):
         )
 
         dists = self.fruit_distances(state, start)
-        dists = jnp.where(values < min_value, jnp.inf, dists)
-        dists = jnp.where(state.fruit_levels > max_level, jnp.inf, dists)
-        dists = jnp.where(state.fruit_consumed, jnp.inf, dists)
+        dists = jnp.where(
+            (values < min_value)
+            | (values == 0)
+            | (state.fruit_levels > max_level)
+            | state.fruit_consumed,
+            jnp.inf,
+            dists,
+        )
 
         best = jnp.argmin(dists)
         action = self.load_or_move_towards(
@@ -541,7 +587,7 @@ class LBFEnv(environment.Environment):
 
 
 def make(
-    grid_size=10,
+    grid_size=8,
     n_players=2,
     n_fruits=5,
     n_fruit_types=3,

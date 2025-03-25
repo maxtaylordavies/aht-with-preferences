@@ -4,3 +4,6 @@
 **/*.pkl
 dist/
 scratch.py
+do_runs
+plots/
+data/

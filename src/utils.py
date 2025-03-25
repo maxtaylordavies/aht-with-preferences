@@ -47,10 +47,11 @@ def visualise_episode(key, env, env_params, policy_fn, sleep=0.5):
 def save_dataframes(
     env_name: str,
     algo_name: str,
+    seed: int,
     train_df: Optional[pd.DataFrame],
     eval_df: Optional[pd.DataFrame],
 ):
-    out_dir = os.path.join("data", env_name, algo_name)
+    out_dir = os.path.join("data", env_name, algo_name, str(seed))
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
     if train_df is not None:

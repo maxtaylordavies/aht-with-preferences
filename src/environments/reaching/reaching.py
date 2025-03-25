@@ -29,6 +29,7 @@ class ReachingEnvState(environment.EnvState):
     agent_types: chex.ArrayNumpy
     agent_rewarded: chex.ArrayNumpy
     goals_attempted: chex.ArrayNumpy
+    max_available_reward: float
     time: int
 
 
@@ -36,6 +37,7 @@ class ReachingEnvState(environment.EnvState):
 class ReachingEnvParams(environment.EnvParams):
     learner_agent_type: int = 12  # -> [1, 1, 0, 0]
     npc_type_dist: chex.ArrayNumpy = jnp.array(-1.0)  # type: ignore
+    normalise_rewards: bool = True
     max_steps_in_episode: int = 20
 
 
@@ -76,8 +78,12 @@ class ReachingEnv(environment.Environment):
             agent_types=agent_types,
             agent_rewarded=False,
             goals_attempted=jnp.zeros(5, dtype=jnp.int32),
+            max_available_reward=1.0,
             time=0,
         )
+        max_reward = self.compute_max_available_reward(state)
+        max_reward = jnp.where(params.normalise_rewards, max_reward, 1.0)
+        state = state.replace(max_available_reward=max_reward)
         return self.get_obs(state, params), state
 
     def step_env(
@@ -141,8 +147,10 @@ class ReachingEnv(environment.Environment):
             agent_types=state.agent_types,
             agent_rewarded=rewarded,
             goals_attempted=state.goals_attempted | is_in_goals,
+            max_available_reward=state.max_available_reward,
             time=state.time + 1,
         )
+        r /= jnp.where(state.max_available_reward == 0, 1.0, state.max_available_reward)
         done = state.time >= params.max_steps_in_episode
         return (  # type: ignore
             jax.lax.stop_gradient(self.get_obs(state)),
@@ -151,6 +159,14 @@ class ReachingEnv(environment.Environment):
             done,
             {},
         )
+
+    def compute_max_available_reward(self, state: ReachingEnvState) -> chex.Array:
+        achievable = (
+            self.prefs_support[state.agent_types[0]]
+            * self.prefs_support[state.agent_types[1]]
+        )
+        achievable = jnp.concatenate([achievable, jnp.array([1.0])])
+        return jnp.max(achievable * self.goal_rewards)
 
     def is_valid_action(
         self,

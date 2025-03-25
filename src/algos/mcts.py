@@ -1,11 +1,44 @@
 import functools
 
+from typing import Tuple
+
+import chex
 import mctx
 import haiku as hk
 import jax as jax
 import jax.numpy as jnp
 import optax
 from gymnax.environments.environment import Environment, EnvParams
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+
+from src.evaluate import Policy
+from src.utils import dotdict
+
+config = dotdict(
+    {
+        "num_hidden_layers": 2,
+        "num_hidden_units": 128,
+        "V_alpha": 0.0001,
+        "pi_alpha": 0.00004,
+        "b1_adam": 0.9,
+        "b2_adam": 0.99,
+        "eps_adam": 1e-5,
+        "wd_adam": 1e-6,
+        "discount": 0.99,
+        "use_mixed_value": True,
+        "value_scale": 0.1,
+        "value_target": "maxq",
+        "target_update_frequency": 100,
+        "batch_size": 128,
+        "avg_return_smoothing": 0.5,
+        "num_simulations": 10,
+        "total_steps": 1e6,
+        "eval_frequency": 5e4,
+        "activation": "relu",
+    }
+)
 
 activation_dict = {
     "relu": jax.nn.relu,
@@ -307,7 +340,7 @@ def get_interaction_loop_fn(
 
 def get_trained_policy(
     pi_func, v_func, pi_params, V_params, recurrent_fn, env_params, config, num_actions
-):
+) -> Policy:
     def policy(key, obs, state):
         _state = jax.tree_util.tree_map(lambda x: x.reshape((1,) + x.shape), state)
         pi_logits = pi_func(pi_params, obs.astype(float)).reshape((1, -1))
@@ -333,3 +366,89 @@ def get_trained_policy(
         return policy_output.action[0]
 
     return policy
+
+
+def train_mcts(
+    key: chex.PRNGKey, env: Environment, env_params: EnvParams
+) -> Tuple[Policy, pd.DataFrame]:
+    eval_freq_batch = config.eval_frequency // config.batch_size
+    opt_t, time_step = 0, 0
+    avg_return = jnp.zeros(config.batch_size)
+    episode_return = jnp.zeros(config.batch_size)
+    num_episodes = jnp.zeros(config.batch_size)
+    num_actions = env.num_actions
+
+    key, subkey = jax.random.split(key)
+    (
+        env_states,
+        v_func,
+        pi_func,
+        V_opt_state,
+        pi_opt_state,
+        V_optim,
+        pi_optim,
+        V_params,
+        V_target_params,
+        pi_params,
+    ) = get_init_fn(env, env_params, config)(subkey)
+    recurrent_fn = get_recurrent_fn(
+        env, env_params, v_func, pi_func, config.batch_size, config
+    )
+    interaction_loop_fn = get_interaction_loop_fn(
+        env,
+        env_params,
+        v_func,
+        pi_func,
+        V_optim,
+        pi_optim,
+        recurrent_fn,
+        num_actions,
+        eval_freq_batch,
+        config,
+    )
+
+    var_dict = locals()
+    run_state = {name: var_dict[name] for name in run_state_names}
+
+    times, avg_returns = [], []
+    pbar = tqdm(total=config.total_steps)
+    num_batches, delta_t = (
+        int(config.total_steps // config.batch_size),
+        int(eval_freq_batch * config.batch_size),
+    )
+    for i in range(int(num_batches // eval_freq_batch)):
+        # perform a number of iterations of agent environment interaction including learning updates
+        run_state = interaction_loop_fn(run_state)
+
+        # avg_return is debiased, and only includes batch elements with at least one completed episode so that it is more meaningful in early episodes
+        valid_avg_returns = run_state["avg_return"][run_state["num_episodes"] > 0]
+        valid_num_episodes = run_state["num_episodes"][run_state["num_episodes"] > 0]
+        avg_return = jnp.mean(
+            valid_avg_returns / (1 - config.avg_return_smoothing**valid_num_episodes)
+        )
+
+        tqdm.write(f"Running Avg Return (t={time_step}): {avg_return}")
+
+        avg_returns += [avg_return]
+        time_step += delta_t
+        times += [time_step]
+        pbar.update(delta_t)
+
+    train_df = pd.DataFrame(
+        {"timestep": np.array(times), "return": np.array(avg_returns)}
+    )
+
+    pi_params, V_params = run_state["pi_params"], run_state["V_params"]
+    recurrent_fn = get_recurrent_fn(env, env_params, v_func, pi_func, 1, config)
+    policy = get_trained_policy(
+        pi_func,
+        v_func,
+        pi_params,
+        V_params,
+        recurrent_fn,
+        env_params,
+        config,
+        num_actions,
+    )
+
+    return policy, train_df
