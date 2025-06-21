@@ -1,4 +1,3 @@
-from collections import namedtuple, defaultdict
 from enum import Enum
 from itertools import product
 from typing import Optional, Tuple, Union, Dict, Any
@@ -7,10 +6,10 @@ import chex
 from flax import struct
 import jax
 import jax.numpy as jnp
-import gymnax.environments.environment as environment
 from gymnax.environments import spaces
+from jax.experimental import checkify
 
-from src.utils import to_one_hot
+from ..environment import EnvState, EnvParams, Environment
 
 
 class Action(Enum):
@@ -30,10 +29,11 @@ def get_prefs_support(n_fruit_types: int) -> chex.Array:
 
 
 @struct.dataclass
-class LBFEnvState(environment.EnvState):
+class LBFEnvState(EnvState):
     agent_locs: chex.Array
     agent_levels: chex.Array
     agent_types: chex.Array
+    agent_features: chex.ArrayNumpy
     fruit_locs: chex.Array
     fruit_levels: chex.Array
     fruit_types: chex.Array
@@ -51,15 +51,17 @@ class NPCPolicyParams:
 
 
 @struct.dataclass
-class LBFEnvParams(environment.EnvParams):
+class LBFEnvParams(EnvParams):
     learner_agent_type: int = 6
     npc_policy_params: NPCPolicyParams = NPCPolicyParams()
     npc_type_dist: chex.Array = jnp.array(-1.0)
-    normalise_rewards: bool = True
-    max_steps_in_episode: int = 50
+    feature_noise: float = 0.05
+    max_steps_in_episode: int = 30
+    move_penalty: float = 0.03
+    load_penalty: float = 0.5
 
 
-class LBFEnv(environment.Environment):
+class LBFEnv(Environment):
     def __init__(
         self,
         grid_size: int,
@@ -67,7 +69,7 @@ class LBFEnv(environment.Environment):
         n_fruits: int,
         n_fruit_types: int,
         max_player_level: int,
-        penalty=0.0,
+        include_agent_features: bool = True,
     ):
         super().__init__()
 
@@ -76,13 +78,18 @@ class LBFEnv(environment.Environment):
         self.n_fruits = n_fruits
         self.n_fruit_types = n_fruit_types
         self.max_player_level = max_player_level
-        self.penalty = penalty
+        self.include_agent_features = include_agent_features
+
+        if self.include_agent_features:
+            self.get_obs = self.get_obs_with_agent_features
+            self.observation_space = self.observation_space_with_agent_features
+        else:
+            self.get_obs = self.get_obs_without_agent_features
+            self.observation_space = self.observation_space_without_agent_features
 
         self.prefs_support = get_prefs_support(self.n_fruit_types)
         self.n_agent_types = len(self.prefs_support)
-        self.default_type_dist = jnp.concatenate(
-            [jnp.array([0.0]), jnp.ones((self.n_agent_types - 1,))]
-        )
+        self.default_type_dist = jnp.ones((self.n_agent_types,))
         self.default_type_dist /= self.default_type_dist.sum()
 
         self.rendering_initialized = False
@@ -96,22 +103,33 @@ class LBFEnv(environment.Environment):
         fruit_locs, fruit_levels, fruit_types, fruit_consumed = self.spawn_fruits(
             key, agent_locs, agent_levels
         )
+
+        agent_features = []
+        for i in range(self.n_players):
+            agent_features.append(
+                jax.random.multivariate_normal(
+                    key,
+                    self.prefs_support[agent_types[i]],
+                    params.feature_noise * jnp.eye(self.n_fruit_types),
+                )
+            )
+
         state = LBFEnvState(
             agent_locs=agent_locs,
             agent_levels=agent_levels,
             agent_types=agent_types,
+            agent_features=jnp.stack(agent_features, axis=0),
             fruit_locs=fruit_locs,
             fruit_levels=fruit_levels,
             fruit_types=fruit_types,
             fruit_consumed=fruit_consumed,
-            goals_attempted=jnp.zeros_like(fruit_types, dtype=jnp.int32),
+            goals_attempted=jnp.zeros((self.n_players, self.n_fruits), dtype=jnp.int32),
             max_available_reward=1.0,
             time=0,
         )
         max_reward = self.compute_max_available_reward(state)
-        max_reward = jnp.where(params.normalise_rewards, max_reward, 1.0)
         state = state.replace(max_available_reward=max_reward)
-        return self.get_obs(state, params), state
+        return self.get_obs(state, 0, params), state
 
     def step_env(
         self,
@@ -121,9 +139,13 @@ class LBFEnv(environment.Environment):
         params: LBFEnvParams,
     ) -> Tuple[chex.Array, LBFEnvState, chex.Array, chex.Array, Dict[Any, Any]]:
         """Perform single timestep state transition."""
-        r = 0
+        penalty = jnp.where(
+            action == Action.LOAD.value, params.load_penalty, params.move_penalty
+        )
+        penalty = jnp.where(action == Action.NONE.value, 0.0, penalty)
+        r = -penalty
 
-        npc_actions = jax.vmap(
+        npc_actions, npc_goals = jax.vmap(
             self.heuristic_policy,
             in_axes=(0, None, 0, None),
         )(
@@ -132,6 +154,7 @@ class LBFEnv(environment.Environment):
             jnp.arange(1, self.n_players),
             params.npc_policy_params,
         )
+        # npc_actions = jnp.zeros_like(npc_actions).astype(jnp.int32)
         actions = jnp.concatenate([jnp.array([action]), npc_actions], dtype=jnp.int32)
 
         # check valid actions
@@ -159,48 +182,62 @@ class LBFEnv(environment.Environment):
         # PROCESS FRUIT COLLECTION
         trying_to_load = (actions == Action.LOAD.value).astype(int)
         consumed = state.fruit_consumed.copy()
-        learner_goal_attempts = jnp.zeros_like(state.fruit_consumed)
+        goals_attempted = jnp.zeros_like(state.goals_attempted)
         for i in range(self.n_fruits):
             # determine if fruit is successfully collected
             attempting = self.adjacent_agents(i, state) * trying_to_load
-            learner_goal_attempts = learner_goal_attempts.at[i].add(attempting[0])
+            goals_attempted = goals_attempted.at[0, i].add(attempting[0])
+            goals_attempted = goals_attempted.at[1, i].add(attempting[1])
             level_sum = (state.agent_levels * attempting).sum()
-            success = (level_sum >= state.fruit_levels[i]) & (~consumed[i])
+            success = ((level_sum >= state.fruit_levels[i]) & (~consumed[i])).astype(
+                int
+            )
+
             # increment reward
             r_ = self.compute_reward(
-                state.agent_types[0], state.fruit_types[i], state.fruit_levels[i]
+                state.agent_types[0],
+                state.fruit_types[i],
+                state.fruit_levels[i],
             )
+            r_ += jnp.where(r_ > 0, params.load_penalty, 0.0)
             r += r_ * success * attempting[0]
             # remove fruit (mark as consumed)
             consumed = consumed.at[i].set(consumed[i] | success)
 
         # Update state dict and evaluate termination conditions
-        state = LBFEnvState(
+        new_state = LBFEnvState(
             agent_locs=new_locs,
             agent_levels=state.agent_levels,
             agent_types=state.agent_types,
+            agent_features=state.agent_features,
             fruit_locs=state.fruit_locs,
             fruit_levels=state.fruit_levels,
             fruit_types=state.fruit_types,
             fruit_consumed=consumed,
-            goals_attempted=state.goals_attempted | learner_goal_attempts,
+            goals_attempted=state.goals_attempted | goals_attempted,
             max_available_reward=state.max_available_reward,
             time=state.time + 1,
         )
-        done = self.is_terminal(state, params)
-        # r /= jnp.where(state.max_available_reward == 0, 1.0, state.max_available_reward)
+        new_obs = self.get_obs(new_state, 0, params)
+        done = self.is_terminal(new_state, params)
+
         return (  # type: ignore
-            jax.lax.stop_gradient(self.get_obs(state)),
-            jax.lax.stop_gradient(state),
+            jax.lax.stop_gradient(new_obs),
+            jax.lax.stop_gradient(new_state),
             r,
             done,
-            {},
+            {
+                "attempted": new_state.goals_attempted[0],
+                "teammate_obs": self.get_obs(new_state, 1, params),
+                "teammate_action": npc_actions[0],
+                "teammate_current_goal": npc_goals[0],
+            },
         )
 
     def compute_reward(
         self, agent_type: int, fruit_type: int, fruit_level: int
     ) -> chex.Array:
-        return fruit_level * self.prefs_support[agent_type][fruit_type]
+        return self.prefs_support[agent_type][fruit_type] * fruit_level
 
     def compute_max_available_reward(self, state: LBFEnvState) -> chex.Array:
         max_reward = 0.0
@@ -259,9 +296,10 @@ class LBFEnv(environment.Environment):
         types = jnp.concatenate([jnp.array([params.learner_agent_type]), npc_types])
 
         # sample levels
-        levels = jax.random.randint(
-            key, (self.n_players,), 1, self.max_player_level + 1
-        )
+        levels = jnp.ones((self.n_players,), dtype=jnp.int32)
+        # levels = jax.random.randint(
+        #     key, (self.n_players,), 1, self.max_player_level + 1
+        # )
 
         # sample positions
         positions = jax.random.permutation(key, jnp.arange(self.grid_size**2))[
@@ -286,7 +324,7 @@ class LBFEnv(environment.Environment):
         positions = jnp.full((self.n_fruits, 2), -1, dtype=jnp.int32)
 
         def cond_fn(state):
-            i, positions, key, _ = state
+            i, _, _, _ = state
             return i < self.n_fruits
 
         def body_fn(state):
@@ -344,47 +382,82 @@ class LBFEnv(environment.Environment):
 
         return positions, levels, types, jnp.zeros((self.n_fruits,), dtype=jnp.int32)
 
-    def get_obs(self, state: LBFEnvState, params=None, key=None) -> chex.Array:  # type: ignore
-        """Applies observation function to state."""
-        fruit_chunk_len = 3 + self.n_fruit_types
-        agent_chunk_len = 3 + self.n_agent_types
+    def get_obs_without_agent_features(
+        self, state: LBFEnvState, agent_idx: int, params: LBFEnvParams, key=None
+    ) -> chex.Array:
+        fruit_chunk_len, agent_chunk_len = 3 + self.n_fruit_types, 3
+
+        def get_fruit_chunk(idx):
+            feats = jax.nn.one_hot(state.fruit_types[idx], self.n_fruit_types)
+            chunk = jnp.array([*state.fruit_locs[idx], state.fruit_levels[idx], *feats])
+            # if fruit is consumed, set all values to -1
+            return jnp.where(state.fruit_consumed[idx], -1, chunk)
+
+        def get_agent_chunk(idx):
+            return jnp.array([*state.agent_locs[idx], state.agent_levels[idx]])
 
         # initialize observation vector
         obs = jnp.zeros(
-            (fruit_chunk_len * self.n_fruits + agent_chunk_len * self.n_players,),
+            ((fruit_chunk_len * self.n_fruits) + (agent_chunk_len * self.n_players)),
             dtype=jnp.float32,
         )
 
         # fruits
         for i in range(self.n_fruits):
+            chunk = get_fruit_chunk(i)
             start, end = fruit_chunk_len * i, fruit_chunk_len * (i + 1)
-            chunk = jnp.array(
-                [
-                    state.fruit_locs[i][0],
-                    state.fruit_locs[i][1],
-                    state.fruit_levels[i],
-                    *to_one_hot(state.fruit_types[i], self.n_fruit_types),
-                ]
-            )
-            # if fruit is consumed, set all values to -1
-            chunk = jnp.where(state.fruit_consumed[i], -1, chunk)
             obs = obs.at[start:end].set(chunk)
 
         # agents
-        for i in range(self.n_players):
-            start, end = (
-                fruit_chunk_len * self.n_fruits + agent_chunk_len * i,
-                fruit_chunk_len * self.n_fruits + agent_chunk_len * (i + 1),
-            )
-            chunk = jnp.array(
+        agent_chunks = [get_agent_chunk(agent_idx)]
+        idx_list = list(range(self.n_players))
+        for i in idx_list[:agent_idx] + idx_list[agent_idx + 1 :]:
+            agent_chunks.append(get_agent_chunk(i))
+        agent_chunks = jnp.concatenate(agent_chunks, axis=0)
+        obs = obs.at[(fruit_chunk_len * self.n_fruits) :].set(agent_chunks)
+
+        return obs
+
+    def get_obs_with_agent_features(self, state: LBFEnvState, agent_idx: int, params: LBFEnvParams, key=None) -> chex.Array:  # type: ignore
+        """Applies observation function to state."""
+        chunk_len = 3 + self.n_fruit_types
+
+        def get_fruit_chunk(idx):
+            feats = jax.nn.one_hot(state.fruit_types[idx], self.n_fruit_types)
+            chunk = jnp.array([*state.fruit_locs[idx], state.fruit_levels[idx], *feats])
+            # if fruit is consumed, set all values to -1
+            return jnp.where(state.fruit_consumed[idx], -1, chunk)
+
+        def get_agent_chunk(idx):
+            return jnp.array(
                 [
-                    state.agent_locs[i][0],
-                    state.agent_locs[i][1],
-                    state.agent_levels[i],
-                    *to_one_hot(state.agent_types[i], self.n_agent_types),
+                    *state.agent_locs[idx],
+                    state.agent_levels[idx],
+                    *state.agent_features[idx],
                 ]
             )
+
+        # initialize observation vector
+        agent_chunks_len = (chunk_len * self.n_players) - 3
+        obs = jnp.zeros(
+            ((chunk_len * self.n_fruits) + agent_chunks_len), dtype=jnp.float32
+        )
+
+        # fruits
+        for i in range(self.n_fruits):
+            chunk = get_fruit_chunk(i)
+            start, end = chunk_len * i, chunk_len * (i + 1)
             obs = obs.at[start:end].set(chunk)
+
+        # agents
+        agent_chunks = [
+            get_agent_chunk(agent_idx)[:3]
+        ]  # only include loc and level for agent_idx
+        idx_list = list(range(self.n_players))
+        for i in idx_list[:agent_idx] + idx_list[agent_idx + 1 :]:
+            agent_chunks.append(get_agent_chunk(i))
+        agent_chunks = jnp.concatenate(agent_chunks, axis=0)
+        obs = obs.at[(chunk_len * self.n_fruits) :].set(agent_chunks)
 
         return obs
 
@@ -398,11 +471,12 @@ class LBFEnv(environment.Environment):
         """Action space of the environment."""
         return spaces.Discrete(len(Action))
 
-    def observation_space(self, params: Optional[LBFEnvParams]) -> spaces.Box:
+    def observation_space_without_agent_features(
+        self, params: Optional[LBFEnvParams]
+    ) -> spaces.Box:
         """Observation space of the environment."""
-        fruit_chunk_len = 3 + self.n_fruit_types
-        agent_chunk_len = 3 + self.n_agent_types
-        obs_len = fruit_chunk_len * self.n_fruits + agent_chunk_len * self.n_players
+        fruit_chunk_len, agent_chunk_len = 3 + self.n_fruit_types, 3
+        obs_len = (fruit_chunk_len * self.n_fruits) + (agent_chunk_len * self.n_players)
 
         min_obs = -1.0 * jnp.ones((obs_len,), dtype=jnp.float32)
 
@@ -411,14 +485,58 @@ class LBFEnv(environment.Environment):
         max_fruit_chunk = jnp.array(
             [max_loc, max_loc, max_fruit_level, *jnp.ones(self.n_fruit_types)]
         )
-        max_agent_chunk = jnp.array(
-            [max_loc, max_loc, self.max_player_level, *jnp.ones(self.n_agent_types)]
-        )
+        max_agent_chunk = jnp.array([max_loc, max_loc, self.max_player_level])
+
         max_obs = jnp.concatenate(
-            [max_fruit_chunk] * self.n_fruits + [max_agent_chunk] * self.n_players
+            ([max_fruit_chunk] * self.n_fruits) + ([max_agent_chunk] * self.n_players)
         )
 
         return spaces.Box(min_obs, max_obs, shape=(obs_len,), dtype=jnp.float32)
+
+    def observation_space_with_agent_features(
+        self, params: Optional[LBFEnvParams]
+    ) -> spaces.Box:
+        """Observation space of the environment."""
+        chunk_len = 3 + self.n_fruit_types
+        obs_len = (chunk_len * self.n_fruits) + (chunk_len * self.n_players) - 3
+
+        min_obs = -1.0 * jnp.ones((obs_len,), dtype=jnp.float32)
+
+        max_loc = self.grid_size - 1
+        max_fruit_level = self.n_fruits * self.max_player_level
+        max_fruit_chunk = jnp.array(
+            [
+                max_loc,
+                max_loc,
+                max_fruit_level,
+                *jnp.ones(self.n_fruit_types),
+            ]
+        )
+        max_features = 2 * jnp.ones(self.n_fruit_types)
+        max_agent_chunk = jnp.array(
+            [
+                max_loc,
+                max_loc,
+                self.max_player_level,
+                *max_features,
+            ]
+        )
+
+        max_obs = jnp.concatenate(
+            ([max_fruit_chunk] * self.n_fruits)
+            + [max_agent_chunk[:3]]
+            + [max_agent_chunk] * (self.n_players - 1)
+        )
+
+        return spaces.Box(min_obs, max_obs, shape=(obs_len,), dtype=jnp.float32)
+
+    def get_type(self, obs: chex.Array) -> chex.Array:
+        type_vec = obs[-self.n_agent_types :]
+        return jnp.argmax(type_vec)
+
+    def get_setting(self, obs: chex.Array) -> chex.Array:
+        type = self.get_type(obs)
+        return jnp.array([0, 0, 1, 1, 1, 1, 2, 2])[type]
 
     @property
     def name(self) -> str:
@@ -458,10 +576,14 @@ class LBFEnv(environment.Environment):
     def fruit_distances(self, state: LBFEnvState, pos: chex.Array) -> chex.Array:
         return jnp.abs(state.fruit_locs - pos).sum(axis=-1)
 
-    def fruit_values(self, state: LBFEnvState, agent_idx) -> chex.Array:
+    def fruit_values(
+        self, state: LBFEnvState, agent_idx, include_consumed=False
+    ) -> chex.Array:
         prefs = self.prefs_support[state.agent_types[agent_idx]]
-        vals = prefs[state.fruit_types]
-        return jnp.where(state.fruit_consumed, 0, state.fruit_levels * vals)
+        vals = state.fruit_levels * prefs[state.fruit_types]
+        consumed_val = jnp.where(include_consumed, 1, 0)
+        return vals * jnp.where(state.fruit_consumed, consumed_val, 1)
+        # return jnp.where(state.fruit_consumed, 0, state.fruit_levels * vals)
 
     def load_or_move_towards(
         self,
@@ -534,7 +656,7 @@ class LBFEnv(environment.Environment):
         state: LBFEnvState,
         agent_idx: int,
         params: NPCPolicyParams,
-    ) -> chex.Array:
+    ) -> Tuple[chex.Array, chex.Array]:
         agent_pos = state.agent_locs[agent_idx]
         centre = self.centre_of_players(state)
         start = jnp.where(params.from_centre, centre, agent_pos)
@@ -559,9 +681,11 @@ class LBFEnv(environment.Environment):
         action = self.load_or_move_towards(
             key, state.agent_locs[agent_idx], state.fruit_locs[best], state
         )
-        return jnp.where(dists[best] == jnp.inf, Action.NONE.value, action)
+        action = jnp.where(dists[best] == jnp.inf, Action.NONE.value, action)
+        goal = jnp.where(dists[best] == jnp.inf, 5, best)
+        return action, goal
 
-    def reference_policy(
+    def oracle_policy(
         self, key: chex.PRNGKey, state: LBFEnvState, agent_idx: int
     ) -> chex.Array:
         self_idx, npc_idx = agent_idx, 1 - agent_idx
@@ -573,7 +697,8 @@ class LBFEnv(environment.Environment):
         )
         own_fruit_vals *= attainable.astype(int)
 
-        distances = self.fruit_distances(state, state.agent_locs[self_idx])
+        centre = self.centre_of_players(state)
+        distances = self.fruit_distances(state, centre)
         distances = jnp.where(
             own_fruit_vals == own_fruit_vals.max(), distances, jnp.inf
         )
@@ -592,6 +717,7 @@ def make(
     n_fruits=5,
     n_fruit_types=3,
     max_player_level=2,
+    include_agent_features=True,
 ) -> Tuple[LBFEnv, LBFEnvParams]:
     env = LBFEnv(
         grid_size=grid_size,
@@ -599,5 +725,6 @@ def make(
         n_fruits=n_fruits,
         n_fruit_types=n_fruit_types,
         max_player_level=max_player_level,
+        include_agent_features=include_agent_features,
     )
     return env, env.default_params

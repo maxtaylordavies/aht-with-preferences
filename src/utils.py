@@ -1,11 +1,12 @@
 import os
 import time
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 import chex
 import jax
 import jax.numpy as jnp
 import pandas as pd
+import pickle
 
 
 # Copied from: https://stackoverflow.com/a/23689767
@@ -15,6 +16,9 @@ class dotdict(dict):
     __getattr__ = dict.get
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
+
+    def replace(self, **kwargs):
+        return dotdict({**self, **kwargs})
 
 
 def to_one_hot(x: int, d: int) -> chex.Array:
@@ -44,20 +48,41 @@ def visualise_episode(key, env, env_params, policy_fn, sleep=0.5):
             break
 
 
-def save_dataframes(
+def save_training_outputs(
+    project_dir: str,
     env_name: str,
     algo_name: str,
     seed: int,
     train_df: Optional[pd.DataFrame],
     eval_df: Optional[pd.DataFrame],
+    trajectories: Optional[Any],
 ):
-    out_dir = os.path.join("data", env_name, algo_name, str(seed))
+    out_dir = os.path.join(project_dir, "data", env_name, algo_name, str(seed))
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
     if train_df is not None:
         train_df.to_pickle(os.path.join(out_dir, "train.pkl"))
     if eval_df is not None:
         eval_df.to_pickle(os.path.join(out_dir, "eval.pkl"))
+    if trajectories is not None:
+        with open(os.path.join(out_dir, "trajectories.pkl"), "wb") as f:
+            pickle.dump(trajectories, f)
+
+
+def load_training_outputs(
+    project_dir: str, env_name: str, algo_name: str, seed: int
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[Any]]:
+    out_dir = os.path.join(project_dir, "data", env_name, algo_name, str(seed))
+    train_df, eval_df, trajectories = None, None, None
+    if os.path.exists(out_dir):
+        if os.path.exists(os.path.join(out_dir, "train.pkl")):
+            train_df = pd.read_pickle(os.path.join(out_dir, "train.pkl"))
+        if os.path.exists(os.path.join(out_dir, "eval.pkl")):
+            eval_df = pd.read_pickle(os.path.join(out_dir, "eval.pkl"))
+        if os.path.exists(os.path.join(out_dir, "trajectories.pkl")):
+            with open(os.path.join(out_dir, "trajectories.pkl"), "rb") as f:
+                trajectories = pickle.load(f)
+    return train_df, eval_df, trajectories
 
 
 def get_type_dists(
@@ -80,4 +105,11 @@ def get_type_dists(
     dists["overall"] = (
         dists["no overlap"] + dists["partial overlap"] + dists["full overlap"]
     )
-    return {k: v / v.sum() for k, v in dists.items()}
+
+    for k, v in dists.items():
+        # v = v.at[0].set(0.0)
+        dists[k] = v / v.sum()
+
+    print(dists)
+
+    return dists

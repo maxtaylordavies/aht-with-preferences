@@ -7,3 +7,6 @@ scratch.py
 do_runs
 plots/
 data/
+bc_params/
+**.npz
+cluster_scripts/experiments/

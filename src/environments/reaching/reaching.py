@@ -5,10 +5,14 @@ import chex
 from flax import struct
 import jax
 import jax.numpy as jnp
-import gymnax.environments.environment as environment
 from gymnax.environments import spaces
 
 from ..simple_gridworld import Action, ACTION_TO_DIRECTION
+from ..environment import Environment, EnvState, EnvParams
+
+
+def get_prefs_support() -> chex.ArrayNumpy:
+    return jnp.array(list(product([0.0, 1.0], repeat=4)))
 
 
 def get_goal_locs(grid_size: int) -> chex.ArrayNumpy:
@@ -24,9 +28,10 @@ def get_goal_locs(grid_size: int) -> chex.ArrayNumpy:
 
 
 @struct.dataclass
-class ReachingEnvState(environment.EnvState):
+class ReachingEnvState(EnvState):
     agent_locs: chex.ArrayNumpy
     agent_types: chex.ArrayNumpy
+    agent_features: chex.ArrayNumpy
     agent_rewarded: chex.ArrayNumpy
     goals_attempted: chex.ArrayNumpy
     max_available_reward: float
@@ -34,14 +39,14 @@ class ReachingEnvState(environment.EnvState):
 
 
 @struct.dataclass
-class ReachingEnvParams(environment.EnvParams):
+class ReachingEnvParams(EnvParams):
     learner_agent_type: int = 12  # -> [1, 1, 0, 0]
     npc_type_dist: chex.ArrayNumpy = jnp.array(-1.0)  # type: ignore
-    normalise_rewards: bool = True
+    feature_noise: float = 0.05
     max_steps_in_episode: int = 20
 
 
-class ReachingEnv(environment.Environment):
+class ReachingEnv(Environment):
     def __init__(
         self,
         grid_size: int,
@@ -58,7 +63,7 @@ class ReachingEnv(environment.Environment):
         self.goal_occupancy_reqs = jnp.array([2, 2, 2, 2, 1])
         self.goal_rewards = jnp.array([1.0, 1.0, 1.0, 1.0, 0.2])
 
-        self.prefs_support = jnp.array(list(product([0.0, 1.0], repeat=4)))
+        self.prefs_support = get_prefs_support()
         self.n_agent_types = len(self.prefs_support)
         self.default_type_dist = jnp.concatenate(
             [jnp.array([0.0]), jnp.ones((self.n_agent_types - 1,))]
@@ -73,18 +78,29 @@ class ReachingEnv(environment.Environment):
     ) -> Tuple[chex.Array, ReachingEnvState]:
         """Reset environment state"""
         agent_locs, agent_types = self.spawn_agents(key, params)
+
+        agent_features = []
+        for i in range(self.n_players):
+            agent_features.append(
+                jax.random.multivariate_normal(
+                    key,
+                    self.prefs_support[agent_types[i]],
+                    params.feature_noise * jnp.eye(4),
+                )
+            )
+
         state = ReachingEnvState(
             agent_locs=agent_locs,
             agent_types=agent_types,
+            agent_features=jnp.stack(agent_features, axis=0),
             agent_rewarded=False,
             goals_attempted=jnp.zeros(5, dtype=jnp.int32),
             max_available_reward=1.0,
             time=0,
         )
         max_reward = self.compute_max_available_reward(state)
-        max_reward = jnp.where(params.normalise_rewards, max_reward, 1.0)
         state = state.replace(max_available_reward=max_reward)
-        return self.get_obs(state, params), state
+        return self.get_obs(state, 0, params), state
 
     def step_env(
         self,
@@ -100,15 +116,15 @@ class ReachingEnv(environment.Environment):
         Dict[Any, Any],
     ]:
         """Perform single timestep state transition."""
-        npc_actions = jax.vmap(
-            self.heuristic_policy,
+        npc_actions, npc_goals = jax.vmap(
+            self.basic_heuristic_policy,
             in_axes=(0, None, 0),
         )(
             jax.random.split(key, self.n_players - 1),
             state,
             jnp.arange(1, self.n_players),
         )
-        # npc_actions = jnp.zeros(self.n_players - 1, dtype=jnp.int32)
+        # npc_actions = jnp.zeros_like(npc_actions)
         actions = jnp.concatenate([jnp.array([action]), npc_actions], dtype=jnp.int32)
 
         # check valid actions
@@ -145,19 +161,25 @@ class ReachingEnv(environment.Environment):
         state = ReachingEnvState(
             agent_locs=new_locs,
             agent_types=state.agent_types,
+            agent_features=state.agent_features,
             agent_rewarded=rewarded,
             goals_attempted=state.goals_attempted | is_in_goals,
             max_available_reward=state.max_available_reward,
             time=state.time + 1,
         )
-        r /= jnp.where(state.max_available_reward == 0, 1.0, state.max_available_reward)
+        obs = self.get_obs(state, 0)
         done = state.time >= params.max_steps_in_episode
         return (  # type: ignore
-            jax.lax.stop_gradient(self.get_obs(state)),
+            jax.lax.stop_gradient(obs),
             jax.lax.stop_gradient(state),
             r,
             done,
-            {},
+            {
+                "teammate_obs": self.get_obs(state, 1),
+                "teammate_action": npc_actions[0],
+                "teammate_current_goal": npc_goals[0],
+                "attempted": state.goals_attempted,
+            },
         )
 
     def compute_max_available_reward(self, state: ReachingEnvState) -> chex.Array:
@@ -212,15 +234,30 @@ class ReachingEnv(environment.Environment):
 
         return jnp.stack(locs, axis=-1), types
 
-    def get_obs(self, state: ReachingEnvState, params=None, key=None) -> chex.Array:  # type: ignore
-        chunk_len = 2 + self.n_agent_types
-        obs = jnp.zeros(self.n_players * chunk_len)
-        for i in range(self.n_players):
-            chunk = jnp.concatenate(
-                [state.agent_locs[i], jnp.eye(self.n_agent_types)[state.agent_types[i]]]
-            )
-            obs = obs.at[i * chunk_len : (i + 1) * chunk_len].set(chunk)
-        return obs
+    def get_obs(self, state: ReachingEnvState, agent_idx: int, params=None, key=None) -> chex.Array:  # type: ignore
+        teammate_idx = 1 - agent_idx
+
+        own_chunk = state.agent_locs[agent_idx]
+        teammate_chunk = jnp.concatenate(
+            [
+                state.agent_locs[teammate_idx],
+                state.agent_features[teammate_idx],
+            ]
+        )
+        return jnp.concatenate([own_chunk, teammate_chunk])
+
+    def get_type(self, obs: chex.Array) -> chex.Array:
+        type_vec = obs[-self.n_agent_types :]
+        return jnp.argmax(type_vec)
+
+    def get_setting(self, obs: chex.Array) -> chex.Array:
+        type = self.get_type(obs)
+        return jnp.array([0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])[type]
+
+    def get_nearest_goal(self, obs: chex.Array, agent_idx: int) -> chex.Array:
+        loc = obs[2 * agent_idx : (2 * agent_idx) + 2]
+        dists = jnp.abs(self.goal_locs - loc).sum(axis=-1)
+        return jnp.argmin(dists)
 
     def action_space(
         self, params: Optional[ReachingEnvParams] = None
@@ -228,16 +265,15 @@ class ReachingEnv(environment.Environment):
         return spaces.Discrete(len(Action))
 
     def observation_space(self, params: Optional[ReachingEnvParams]) -> spaces.Box:
-        obs_len = self.n_players * (2 + self.n_agent_types)
-        min_obs = jnp.zeros(obs_len)
-        max_obs = jnp.array(
-            [self.grid_size - 1, self.grid_size - 1, *jnp.ones(self.n_agent_types)]
-            * self.n_players
+        obs_len = 2 + ((self.n_players - 1) * 6)
+        min_obs = -jnp.ones(obs_len)
+
+        max_chunk = jnp.array([self.grid_size - 1, self.grid_size - 1, 2, 2, 2, 2])
+        max_obs = [jnp.array([self.grid_size - 1, self.grid_size - 1])] + (
+            [max_chunk] * (self.n_players - 1)
         )
-        # min_obs = jnp.zeros((2 * self.n_players,), dtype=jnp.float32)
-        # max_obs = (self.grid_size - 1) * jnp.ones(
-        #     (2 * self.n_players,), dtype=jnp.float32
-        # )
+        max_obs = jnp.concatenate(max_obs)
+
         return spaces.Box(min_obs, max_obs, shape=(obs_len,), dtype=jnp.float32)
 
     @property
@@ -314,6 +350,7 @@ class ReachingEnv(environment.Environment):
 
         # randomly choose between vertical and horizontal movement if both are valid
         choice = jax.random.randint(key, (), 0, 2)
+        # choice = 0
         action = jnp.where(choice == 0, vertical_action, horizontal_action)
 
         # if move action is 0, set move action to the maximum of the two
@@ -321,12 +358,12 @@ class ReachingEnv(environment.Environment):
             action == 0, jnp.maximum(vertical_action, horizontal_action), action
         )
 
-    def heuristic_policy(
+    def basic_heuristic_policy(
         self,
         key: chex.PRNGKey,
         state: ReachingEnvState,
         agent_idx: int,
-    ) -> chex.Array:
+    ) -> Tuple[chex.Array, chex.Array]:
         agent_loc, agent_type = (
             state.agent_locs[agent_idx],
             state.agent_types[agent_idx],
@@ -339,11 +376,45 @@ class ReachingEnv(environment.Environment):
 
         goal_idx = jnp.argmin(goal_distances)
         move_action = self.go_to_goal(key, agent_loc, goal_idx)
-        return jnp.where(
-            goal_distances[goal_idx] != jnp.inf, move_action, Action.NONE.value
+
+        return (
+            jnp.where(
+                goal_distances[goal_idx] != jnp.inf, move_action, Action.NONE.value
+            ),
+            jnp.where(goal_distances[goal_idx] == jnp.inf, 5, goal_idx),
         )
 
-    def reference_policy(
+    def heuristic_policy(
+        self,
+        key: chex.PRNGKey,
+        state: ReachingEnvState,
+        agent_idx: int,
+    ) -> Tuple[chex.Array, chex.Array]:
+        own_goals = self.prefs_support[state.agent_types[agent_idx]]
+        teammate_goals = self.prefs_support[state.agent_types[1 - agent_idx]]
+
+        feasible = jnp.concatenate([own_goals * teammate_goals, jnp.array([1.0])])
+        values = feasible * self.goal_rewards
+
+        centre = self.centre_of_players(state)
+        goal_distances = jnp.abs(self.goal_locs - centre).sum(axis=-1)
+        goal_distances = jnp.where(values == values.max(), goal_distances, jnp.inf)
+
+        goal_idx = jnp.argmin(goal_distances)
+        action = self.go_to_goal(key, state.agent_locs[agent_idx], goal_idx)
+
+        is_in_goal = (
+            jnp.all(state.agent_locs[agent_idx] == self.goal_locs, axis=-1)
+            .astype(int)
+            .sum()
+        )
+
+        action = jnp.where(is_in_goal, Action.NONE.value, action)
+        goal_idx = jnp.where(is_in_goal, 5, goal_idx)
+
+        return action, goal_idx
+
+    def oracle_policy(
         self, key: chex.PRNGKey, state: ReachingEnvState, agent_index: int
     ):
         own_goals = self.prefs_support[state.agent_types[agent_index]]
@@ -359,22 +430,13 @@ class ReachingEnv(environment.Environment):
 
         goal_idx = jnp.argmin(goal_distances)
 
-        # values = feasible * self.goal_rewards
-
-        # centre = self.centre_of_players(state)
-        # goal_distances = jnp.abs(self.goal_locs - centre).sum(axis=-1)
-        # values -= goal_distances * self.penalty
-
-        # goal_idx = jnp.where(jnp.max(values))
-
-        # goal_idx = jnp.argmax(values)
         return self.go_to_goal(key, state.agent_locs[agent_index], goal_idx)
 
 
 def make(
-    grid_size=7,
+    grid_size=9,
     n_players=2,
-    penalty=0.01,
+    penalty=0.0,
 ) -> Tuple[ReachingEnv, ReachingEnvParams]:
     env = ReachingEnv(
         grid_size=grid_size,

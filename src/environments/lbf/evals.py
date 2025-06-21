@@ -1,7 +1,9 @@
-from typing import Dict
+from typing import Any, Dict
 
 import chex
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
@@ -13,9 +15,8 @@ goal_metric_keys = ["n_total", "n_g_1", "n_g_2", "n_g_3", "n_g_4", "n_solo", "n_
 
 
 def compute_episode_goal_stats(
-    env: LBFEnv, final_state: LBFEnvState
+    env: LBFEnv, final_state: LBFEnvState, attempted: chex.Array
 ) -> Dict[str, chex.Array]:
-    attempted = final_state.goals_attempted
     types = final_state.fruit_types
     levels = final_state.fruit_levels
 
@@ -24,7 +25,7 @@ def compute_episode_goal_stats(
     shared_prefs = learner_prefs * teammate_prefs
 
     learner_level = final_state.agent_levels[0]
-    solo = jnp.where((levels <= learner_level), 1, 0)
+    solo = jnp.where(levels <= learner_level, 1, 0)
     coop = 1 - solo
 
     # number of goals attempted outside G_learner
@@ -43,6 +44,23 @@ def compute_episode_goal_stats(
     n_solo, n_coop = (attempted * solo).sum(), (attempted * coop).sum()
     n_total = n_solo + n_coop
 
+    # jax.debug.print(
+    #     "attempted: {attempted}, consumed: {consumed}, types: {types}, levels: {levels}, learner_prefs: {learner_prefs}, teammate_prefs: {teammate_prefs}, shared_prefs: {shared_prefs}, solo: {solo}, coop: {coop}, n_g_2: {n_g_2}, n_g_4: {n_g_4}, ret: {ret}, rewards: {rewards}",
+    #     attempted=attempted,
+    #     consumed=final_state.fruit_consumed,
+    #     types=types,
+    #     levels=levels,
+    #     learner_prefs=learner_prefs,
+    #     teammate_prefs=teammate_prefs,
+    #     shared_prefs=shared_prefs,
+    #     solo=solo,
+    #     coop=coop,
+    #     n_g_2=n_g_2,
+    #     n_g_4=n_g_4,
+    #     ret=ret,
+    #     rewards=rewards,
+    # )
+
     vars = locals()
     return {k: vars[k] for k in goal_metric_keys}
 
@@ -52,7 +70,9 @@ def run_evals(
     policy: Policy,
     env: LBFEnv,
     default_env_params: LBFEnvParams,
+    init_extra: Dict[str, Any] = {},
     num_seeds=100,
+    normalise_return=False,
 ) -> pd.DataFrame:
     eval_data = {"eval type": [], "return": []}
     eval_data = {**eval_data, **{k: [] for k in goal_metric_keys}}
@@ -66,8 +86,9 @@ def run_evals(
             max_steps_in_episode=default_env_params.max_steps_in_episode,
             learner_agent_type=default_env_params.learner_agent_type,
             npc_policy_params=default_env_params.npc_policy_params,
-            normalise_rewards=default_env_params.normalise_rewards,
             npc_type_dist=eval_npc_type_dists[k],
+            move_penalty=0.0,
+            load_penalty=0.0,
         )
         _, returns, metrics = evaluate(
             policy,
@@ -75,11 +96,19 @@ def run_evals(
             env,
             env_params,
             compute_episode_goal_stats,
+            init_extra,
             num_seeds,
             max_steps_in_episode=env_params.max_steps_in_episode,
+            normalise_return=normalise_return,
         )
         eval_data["eval type"].extend([k] * num_seeds)
         eval_data["return"].extend(returns.tolist())
         for k, v in metrics.items():
-            eval_data[k].extend([int(v.sum())] * num_seeds)
+            eval_data[k].extend(v.tolist())
+
+    eval_data["eval type"].append("average")
+    eval_data["return"].append(np.nanmean(eval_data["return"]))
+    for k in goal_metric_keys:
+        eval_data[k].append(0.0)
+
     return pd.DataFrame(eval_data)

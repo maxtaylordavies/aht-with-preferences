@@ -1,0 +1,9 @@
+cd /Users/max/Code/
+rm -rf aht-copy aht-copy.zip
+cp -r aht-with-preferences aht-copy
+cd aht-copy
+rm -rf .git data bc_params .DS_Store
+cd ../
+zip -r aht-copy.zip aht-copy
+rm -rf aht-copy
+scp aht-copy.zip s2227283@student.ssh.inf.ed.ac.uk:/afs/inf.ed.ac.uk/user/s22/s2227283/projects/
